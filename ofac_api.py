@@ -286,11 +286,18 @@ def search_party():
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import hypercorn.asyncio
+    import os
     import asyncio
-    config = hypercorn.Config()
-    config.bind = ["0.0.0.0:10000"]
-    config.workers = 1
+    import hypercorn.asyncio
+    from hypercorn.config import Config
+
+    # Render が注入する PORT（例: 8000）を取得。ローカル実行時は 10000 をデフォルトに
+    port = int(os.getenv("PORT", "10000"))
+
+    config = Config()
+    config.bind = [f"0.0.0.0:{port}"]
+    config.workers = int(os.getenv("WORKERS", "1"))
     config.keep_alive_timeout = 65
-    logger.info("OFAC API サーバー起動: %s", config.bind)
+
+    logger.info("OFAC API サーバー起動: http://0.0.0.0:%d", port)
     asyncio.run(hypercorn.asyncio.serve(app, config))
