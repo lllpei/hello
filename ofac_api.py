@@ -2,6 +2,14 @@
 import sqlite3
 import pandas as pd
 from pathlib import Path
+import logging
+
+# ロギングの設定
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -14,8 +22,10 @@ def query_to_df(conn, sql: str, params=()):
 def get_party_data(party_id: int):
     """Return sanction party data broken into sections. Return None if party_id not found."""
     if not DB_FILE.exists():
+        logger.error(f"DBファイルが見つかりません: {DB_FILE}")
         return {"error": f"DB ファイル {DB_FILE} が見つかりません。"}
 
+    logger.info(f"パーティデータの取得を開始: party_id={party_id}")
     conn = sqlite3.connect(DB_FILE)
 
     # Details
@@ -45,6 +55,7 @@ def get_party_data(party_id: int):
     details_df = query_to_df(conn, details_sql, (party_id,))
 
     if details_df.empty:
+        logger.warning(f"パーティデータが見つかりません: party_id={party_id}")
         conn.close()
         return None
 
@@ -88,7 +99,7 @@ def get_party_data(party_id: int):
     addr_df = query_to_df(conn, addr_sql, (party_id,))
 
     conn.close()
-
+    logger.info(f"パーティデータの取得に成功: party_id={party_id}")
     return {
         "details": details_df.to_dict(orient="records")[0],
         "identifications": ident_df.to_dict(orient="records"),
@@ -99,9 +110,11 @@ def get_party_data(party_id: int):
 @app.route('/ofacParty', methods=['GET'])
 def ofac_party():
     party_id_param = request.args.get('partyId')
+    logger.info(f"OFACパーティAPIリクエスト受信: partyId={party_id_param}")
 
     # Validate partyId
     if not party_id_param or not party_id_param.isdigit():
+        logger.warning(f"無効なpartyIdパラメータ: {party_id_param}")
         return jsonify({
             "resultCd": False,
             "message": "partyId を数値で指定してください"
@@ -114,21 +127,28 @@ def ofac_party():
 
     # Database file missing
     if isinstance(result, dict) and "error" in result:
+        logger.error(f"DBファイルエラー: {result['error']}")
         return jsonify({"resultCd": False, "message": result["error"]}), 500
 
     # Not found
     if result is None:
+        logger.warning(f"パーティデータが見つかりません: party_id={party_id}")
         return jsonify({
             "resultCd": False,
             "message": f"party_id={party_id} のデータが見つかりません"
         }), 404
 
     # Success
+    logger.info(f"OFACパーティAPIレスポンス送信: party_id={party_id}")
     return jsonify({"resultCd": True, "data": result})
 
 if __name__ == '__main__':
     import hypercorn.asyncio
     import asyncio
+    logger.info("OFAC APIサーバーを起動しています…")
     config = hypercorn.Config()
     config.bind = ["0.0.0.0:10000"]
+    config.workers = 1
+    config.keep_alive_timeout = 65
+    logger.info(f"サーバー設定: bind={config.bind}, workers={config.workers}")
     asyncio.run(hypercorn.asyncio.serve(app, config))
