@@ -1,29 +1,19 @@
 ﻿from typing import Dict, Any, Optional
 import os
 import sys
+import httpx
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-import httpx
 from mcp.server.fastmcp import FastMCP
-from fastapi import FastAPI
-from starlette.routing import Mount
-from asgiref.wsgi import WsgiToAsgi
-from ofac_api import app as flask_app  # ← 既存 Flask API をインポート
 
 """
-OFAC MCP (SSE 版)
-=================
-* FastMCP 高レベル API + Server‑Sent Events トランスポート
-* 既存 ofac_api (Flask) を ASGI ラッパー経由で同ポート配下にマウント
-* Hypercorn 1 プロセスで `/ofacParty/...` と `/mcp/...` を同時提供
-
-エンドポイント構成
-------------------
-- **/ofacParty**                 : Flask REST API (既存)
-- **/ofacParty/search**          : 同上 (検索拡張)
-- **/mcp/sse** (GET)            : text/event‑stream (MCP)
-- **/mcp/messages** (POST)      : JSON‑RPC (MCP)
+OFAC MCP Tool (extended)
+------------------------
+2025-05-04
+ - /ofacParty/search の統合検索 API に合わせて検索ツールを拡張
+ - search_party(q, scope, country, city, limit, fuzzy)
+ - 既存 get_ofac_party_info(party_id) は変更なし
 """
 
 # ──────────────────────────────────────────────
@@ -31,7 +21,7 @@ OFAC MCP (SSE 版)
 # ──────────────────────────────────────────────
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / "ofac_mcp_sse.log"
+LOG_FILE = LOG_DIR / "ofac_mcp.log"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,23 +37,29 @@ logger = logging.getLogger(__name__)
 # 環境変数ロード
 # ──────────────────────────────────────────────
 load_dotenv()
-BASE_URL = os.getenv("BASE_URL", "https://hello-render-rbg8.onrender.com")
-API_ENDPOINT    = f"{BASE_URL}/ofacParty"
-SEARCH_ENDPOINT = f"{API_ENDPOINT}/search"
+
+# Flask API エンドポイント (env で上書き可)
+DEFAULT_BASE = "https://hello-render-rbg8.onrender.com/ofacParty"
+API_ENDPOINT = os.getenv("API_ENDPOINT", DEFAULT_BASE)
+SEARCH_ENDPOINT = os.getenv("SEARCH_ENDPOINT", f"{DEFAULT_BASE}/search")
 
 logger.info("API_ENDPOINT = %s", API_ENDPOINT)
 logger.info("SEARCH_ENDPOINT = %s", SEARCH_ENDPOINT)
 
 # ──────────────────────────────────────────────
-# MCP サーバー (FastMCP)
+# MCP サーバ初期化
 # ──────────────────────────────────────────────
 MCP_NAME = "ofac_party_service"
 mcp = FastMCP(MCP_NAME)
 
+# ──────────────────────────────────────────────
+# 共通 util
+# ──────────────────────────────────────────────
 ALLOWED_SCOPES = {"all", "name", "alias", "address"}
 
 
 def _extract_error_message(resp: httpx.Response) -> str:
+    """API 返却 JSON から message を抽出 (fallback は status/text)"""
     try:
         data = resp.json()
         return data.get("message", f"API Error: {resp.status_code}")
@@ -72,7 +68,7 @@ def _extract_error_message(resp: httpx.Response) -> str:
 
 
 # ──────────────────────────────────────────────
-# ツール: 個別パーティ取得
+# ツール: 個別取得
 # ──────────────────────────────────────────────
 
 @mcp.tool()
@@ -119,9 +115,25 @@ async def search_party(
     limit: int = 100,
     fuzzy: bool = False
 ) -> Dict[str, Any]:
-    """名前・別名・住所を含む統合検索を実行します"""
+    """名前・別名・住所を含む統合検索を実行します
+
+    Args:
+        q (str): 検索語 (2 文字以上)
+        scope (str, optional): "all" | "name" | "alias" | "address". デフォルト "all".
+        country (str, optional): 国コードまたは国名
+        city (str, optional): 都市名
+        limit (int, optional): 最大取得件数 (1–1000)
+        fuzzy (bool, optional): 類似度検索 (true=有効)
+
+    Returns:
+        Dict[str, Any]:
+            - status: success / error
+            - data : 検索結果 (list) ※ success 時
+            - message: エラー詳細 (error 時)
+    """
     logger.info("search_party start: q=%s, scope=%s", q, scope)
 
+    # 入力バリデーション
     q = (q or "").strip()
     if len(q) < 2:
         return {"status": "error", "message": "q must be at least 2 characters"}
@@ -132,7 +144,11 @@ async def search_party(
 
     limit = max(1, min(int(limit or 100), 1000))
 
-    params: Dict[str, Any] = {"q": q, "scope": scope, "limit": str(limit)}
+    params: Dict[str, Any] = {
+        "q": q,
+        "scope": scope,
+        "limit": str(limit),
+    }
     if country:
         params["country"] = country
     if city:
@@ -167,33 +183,13 @@ async def search_party(
 
 
 # ──────────────────────────────────────────────
-# ASGI アプリ (Flask + MCP) を統合
-# ──────────────────────────────────────────────
-
-flask_asgi = WsgiToAsgi(flask_app)
-
-combined_app = FastAPI(title="OFAC API + MCP (SSE)")
-combined_app.router.routes.append(Mount("/", app=flask_asgi, name="ofac_api"))
-combined_app.router.routes.append(Mount("/mcp", app=mcp.sse_app(), name="mcp"))
-
-
-# ──────────────────────────────────────────────
-# エントリポイント
+# ENTRY POINT
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import hypercorn.asyncio as hyper_asyncio
-    from hypercorn.config import Config
-    import asyncio
-
-    cfg = Config()
-    cfg.bind = ["0.0.0.0:10000"]  # ofac_api と同じポート
-    cfg.workers = 1
-    cfg.keep_alive_timeout = 65
-
-    logger.info("Starting combined OFAC API + MCP (SSE) server on %s", cfg.bind)
     try:
-        asyncio.run(hyper_asyncio.serve(combined_app, cfg))
+        logger.info("Starting OFAC MCP server (SSE transport)…")
+        mcp.run(transport="sse", host="0.0.0.0", port=10001)
     except Exception as exc:
-        logger.exception("Server startup failed: %s", str(exc))
+        logger.exception("MCP server startup failed: %s", str(exc))
         sys.exit(1)
