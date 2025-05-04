@@ -129,4 +129,6 @@ def ofac_party():
 if __name__ == '__main__':
     import hypercorn.asyncio
     import asyncio
-    asyncio.run(hypercorn.asyncio.serve(app, hypercorn.Config()))
+    config = hypercorn.Config()
+    config.bind = ["0.0.0.0:10000"]
+    asyncio.run(hypercorn.asyncio.serve(app, config))
