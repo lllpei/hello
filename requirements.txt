@@ -1,6 +1,8 @@
 ﻿# --- Flask / Web ---
 flask>=2.3.0
 werkzeug>=2.3.0
+uvicorn>=0.15.0
+hypercorn>=0.15.0
 
 # --- data / helpers ---
 pandas>=1.5.3
